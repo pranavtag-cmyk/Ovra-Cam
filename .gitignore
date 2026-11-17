@@ -1,0 +1,16 @@
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+.idea/
+# Windows
+windows/packages/
+windows/x64/
+windows/**/x64/
+windows/**/bin/
+windows/**/obj/
+windows/.vs/
+*.user
+dist/

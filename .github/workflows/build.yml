@@ -1,0 +1,113 @@
+name: Build Ovra Cam
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+      - name: Build APK
+        working-directory: android
+        run: gradle assembleRelease --no-daemon --stacktrace
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk out/OvraCam.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OvraCam-Android
+          path: out/OvraCam.apk
+
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - uses: nuget/setup-nuget@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Pick C++ toolset
+        id: vs
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $ver = & $vswhere -latest -products * -property installationVersion
+          $major = [int]($ver.Split('.')[0])
+          $ts = if ($major -ge 18) { 'v145' } else { 'v143' }
+          Write-Host "Visual Studio $ver -> toolset $ts"
+          "toolset=$ts" >> $env:GITHUB_OUTPUT
+
+      - name: Restore C++ packages
+        run: nuget restore windows/OvraCam.sln -PackagesDirectory windows/packages
+
+      - name: Build virtual camera (OvraCamSource.dll)
+        run: msbuild windows/OvraCam.sln /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=${{ steps.vs.outputs.toolset }}
+
+      - name: Build desktop app
+        run: dotnet publish windows/OvraCamApp/OvraCamApp.csproj -c Release -o dist/app
+
+      - name: Gather files
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path windows -Recurse -Filter OvraCamSource.dll | Where-Object { $_.FullName -match 'Release' } | Select-Object -First 1
+          if (-not $dll) { throw "OvraCamSource.dll not found" }
+          Copy-Item $dll.FullName dist/OvraCamSource.dll
+          Copy-Item $dll.FullName dist/app/OvraCamSource.dll
+          Remove-Item dist/app/*.pdb -ErrorAction SilentlyContinue
+          Invoke-WebRequest https://dl.google.com/android/repository/platform-tools-latest-windows.zip -OutFile pt.zip
+          Expand-Archive pt.zip -DestinationPath pt
+          New-Item -ItemType Directory -Force dist/adb | Out-Null
+          Copy-Item pt/platform-tools/adb.exe, pt/platform-tools/AdbWinApi.dll, pt/platform-tools/AdbWinUsbApi.dll dist/adb/
+          Get-ChildItem dist -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          # avoid installing the app DLL twice: the .iss installs it separately with COM registration
+          Remove-Item dist/app/OvraCamSource.dll
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          & $iscc "/DAppVersion=1.0.${{ github.run_number }}" windows/installer/OvraCam.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OvraCam-Windows
+          path: dist/OvraCam-Setup-*.exe
+
+  release:
+    name: Publish release
+    needs: [android, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Ovra Cam 1.0.${{ github.run_number }}
+          body: |
+            **Phone:** install `OvraCam.apk` on your Android phone.
+            **PC (Windows 11):** run `OvraCam-Setup-1.0.${{ github.run_number }}.exe`.
+          files: files/*
