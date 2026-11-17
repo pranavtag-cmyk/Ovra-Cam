@@ -3,7 +3,7 @@
 
 #define AppName "Ovra Cam"
 #ifndef AppVersion
-  #define AppVersion "1.0.0"
+  #define AppVersion "2.0.0"
 #endif
 
 [Setup]
@@ -16,7 +16,7 @@ DefaultDirName={autopf}\Ovra Cam
 DefaultGroupName=Ovra Cam
 DisableProgramGroupPage=yes
 OutputDir=..\..\dist
-OutputBaseFilename=OvraCam-Setup-{#AppVersion}
+OutputBaseFilename=OvraCam-Setup-v{#AppVersion}
 SetupIconFile=..\OvraCamApp\Assets\ovracam.ico
 UninstallDisplayIcon={app}\OvraCam.exe
 Compression=lzma2/max

@@ -27,11 +27,11 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p out
-          cp android/app/build/outputs/apk/release/app-release.apk out/OvraCam.apk
+          cp android/app/build/outputs/apk/release/app-release.apk out/OvraCam-v2.0.${{ github.run_number }}.apk
       - uses: actions/upload-artifact@v4
         with:
           name: OvraCam-Android
-          path: out/OvraCam.apk
+          path: out/*.apk
 
   windows:
     name: Windows installer
@@ -86,7 +86,7 @@ jobs:
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
           $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
           if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
-          & $iscc "/DAppVersion=1.0.${{ github.run_number }}" windows/installer/OvraCam.iss
+          & $iscc "/DAppVersion=2.0.${{ github.run_number }}" windows/installer/OvraCam.iss
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
 
       - uses: actions/upload-artifact@v4
@@ -105,9 +105,9 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: Ovra Cam 1.0.${{ github.run_number }}
+          tag_name: v2.0.${{ github.run_number }}
+          name: Ovra Cam v2.0.${{ github.run_number }}
           body: |
-            **Phone:** install `OvraCam.apk` on your Android phone.
-            **PC (Windows 11):** run `OvraCam-Setup-1.0.${{ github.run_number }}.exe`.
+            **Phone:** install `OvraCam-v2.0.${{ github.run_number }}.apk` on your Android phone.
+            **PC (Windows 11):** run `OvraCam-Setup-v2.0.${{ github.run_number }}.exe`.
           files: files/*
