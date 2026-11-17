@@ -20,41 +20,42 @@ HRESULT MediaStream::Initialize(IMFMediaSource* source, int index)
 
 	RETURN_IF_FAILED(MFCreateEventQueue(&_queue));
 
-	// set 1 here to force RGB32 only
-	auto types = wil::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(2);
+	// Ovra Cam offers 1080p (default), 720p and 4K, in NV12 (preferred by most apps) and RGB32
+	struct Size { UINT w; UINT h; };
+	const Size sizes[] = { { 1920, 1080 }, { 1280, 720 }, { 3840, 2160 } };
+	const UINT numSizes = ARRAYSIZE(sizes);
+	auto types = wil::make_unique_cotaskmem_array<wil::com_ptr_nothrow<IMFMediaType>>(numSizes * 2);
 
-#define NUM_IMAGE_COLS 1280 // Ovra Cam outputs 720p (16:9)
-#define NUM_IMAGE_ROWS 720
-
-	wil::com_ptr_nothrow<IMFMediaType> rgbType;
-	RETURN_IF_FAILED(MFCreateMediaType(&rgbType));
-	rgbType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-	rgbType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-	MFSetAttributeSize(rgbType.get(), MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-	rgbType->SetUINT32(MF_MT_DEFAULT_STRIDE, NUM_IMAGE_COLS * 4);
-	rgbType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
-	rgbType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-	MFSetAttributeRatio(rgbType.get(), MF_MT_FRAME_RATE, 30, 1);
-	auto bitrate = (uint32_t)(NUM_IMAGE_COLS * NUM_IMAGE_ROWS * 4 * 8 * 30);
-	rgbType->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-	MFSetAttributeRatio(rgbType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-	types[1] = rgbType.detach();
-
+	for (UINT i = 0; i < numSizes; i++)
 	{
+		auto w = sizes[i].w;
+		auto h = sizes[i].h;
+
 		wil::com_ptr_nothrow<IMFMediaType> nv12Type;
 		RETURN_IF_FAILED(MFCreateMediaType(&nv12Type));
 		nv12Type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
 		nv12Type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
 		nv12Type->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
 		nv12Type->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
-		MFSetAttributeSize(nv12Type.get(), MF_MT_FRAME_SIZE, NUM_IMAGE_COLS, NUM_IMAGE_ROWS);
-		nv12Type->SetUINT32(MF_MT_DEFAULT_STRIDE, NUM_IMAGE_COLS); // NV12 Y-plane stride is the width
+		MFSetAttributeSize(nv12Type.get(), MF_MT_FRAME_SIZE, w, h);
+		nv12Type->SetUINT32(MF_MT_DEFAULT_STRIDE, w); // NV12 Y-plane stride is the width
 		MFSetAttributeRatio(nv12Type.get(), MF_MT_FRAME_RATE, 30, 1);
-		// frame size * pixel bit size * framerate
-		bitrate = (uint32_t)(NUM_IMAGE_COLS * 1.5 * NUM_IMAGE_ROWS * 8 * 30);
-		nv12Type->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
+		nv12Type->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)min((ULONGLONG)w * h * 12 * 30, 0xFFFFFFFFull));
 		MFSetAttributeRatio(nv12Type.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
-		types[0] = nv12Type.detach();
+		types[i] = nv12Type.detach();
+
+		wil::com_ptr_nothrow<IMFMediaType> rgbType;
+		RETURN_IF_FAILED(MFCreateMediaType(&rgbType));
+		rgbType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+		rgbType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+		MFSetAttributeSize(rgbType.get(), MF_MT_FRAME_SIZE, w, h);
+		rgbType->SetUINT32(MF_MT_DEFAULT_STRIDE, w * 4);
+		rgbType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+		rgbType->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+		MFSetAttributeRatio(rgbType.get(), MF_MT_FRAME_RATE, 30, 1);
+		rgbType->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)min((ULONGLONG)w * h * 32 * 30, 0xFFFFFFFFull));
+		MFSetAttributeRatio(rgbType.get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+		types[numSizes + i] = rgbType.detach();
 	}
 
 	RETURN_IF_FAILED_MSG(MFCreateStreamDescriptor(_index, (DWORD)types.size(), types.get(), &_descriptor), "MFCreateStreamDescriptor failed");
@@ -86,9 +87,13 @@ HRESULT MediaStream::Start(IMFMediaType* type)
 		WINTRACE(L"MediaStream::Start format: %s", GUID_ToStringW(_format).c_str());
 	}
 
+	UINT32 width = 1920, height = 1080;
+	MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &width, &height);
+	WINTRACE(L"MediaStream::Start size: %u x %u", width, height);
+
 	// at this point, set D3D manager may have not been called
 	// so we want to create a D2D1 renter target anyway
-	RETURN_IF_FAILED(_generator.EnsureRenderTarget(NUM_IMAGE_COLS, NUM_IMAGE_ROWS));
+	RETURN_IF_FAILED(_generator.EnsureRenderTarget(width, height));
 
 	RETURN_IF_FAILED(_allocator->InitializeSampleAllocator(10, type));
 	RETURN_IF_FAILED(_queue->QueueEventParamVar(MEStreamStarted, GUID_NULL, S_OK, nullptr));
@@ -124,7 +129,7 @@ HRESULT MediaStream::SetD3DManager(IUnknown* manager)
 
 	// comment these 2 lines to force CPU usage
 	RETURN_IF_FAILED(_allocator->SetDirectXManager(manager));
-	RETURN_IF_FAILED(_generator.SetD3DManager(manager, NUM_IMAGE_COLS, NUM_IMAGE_ROWS));
+	RETURN_IF_FAILED(_generator.SetD3DManager(manager));
 	return S_OK;
 }
 

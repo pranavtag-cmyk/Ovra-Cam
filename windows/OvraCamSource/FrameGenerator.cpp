@@ -6,29 +6,49 @@
 #include "FrameGenerator.h"
 #include "OvraShared.h"
 
+// Builds the drawing surface for the requested output size. GPU (D3D) when the consumer gave us a
+// D3D manager (Windows Camera app, OBS...), CPU (WIC) otherwise (browsers, Teams...).
 HRESULT FrameGenerator::EnsureRenderTarget(UINT width, UINT height)
 {
-	if (!HasD3DManager())
+	RETURN_HR_IF(E_INVALIDARG, !width || !height);
+	_requestedWidth = width;
+	_requestedHeight = height;
+	if (_renderTarget && _width == width && _height == height)
+		return S_OK;
+
+	_renderTarget.reset();
+	_texture.reset();
+	_bitmap.reset();
+	_converter.reset();
+	_phoneBitmap.reset();
+
+	if (_dxgiManager)
 	{
-		// create a D2D1 render target from WIC bitmap
-		wil::com_ptr_nothrow<ID2D1Factory> d2d1Factory;
-		RETURN_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, IID_PPV_ARGS(&d2d1Factory)));
+		auto hr = CreateGpuResources(width, height);
+		if (SUCCEEDED(hr))
+			return S_OK;
 
-		wil::com_ptr_nothrow<IWICImagingFactory> wicFactory;
-		RETURN_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wicFactory)));
-
-		RETURN_IF_FAILED(wicFactory->CreateBitmap(width, height, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &_bitmap));
-
-		D2D1_RENDER_TARGET_PROPERTIES props{};
-		props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
-		props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
-		RETURN_IF_FAILED(d2d1Factory->CreateWicBitmapRenderTarget(_bitmap.get(), props, &_renderTarget));
-
-		RETURN_IF_FAILED(CreateRenderTargetResources(width, height));
+		WINTRACE(L"FrameGenerator GPU resources failed 0x%08X, using CPU", hr);
+		_renderTarget.reset();
+		_texture.reset();
+		_converter.reset();
 	}
 
-	_prevTime = MFGetSystemTime();
-	_frame = 0;
+	// create a D2D1 render target from WIC bitmap
+	wil::com_ptr_nothrow<ID2D1Factory> d2d1Factory;
+	RETURN_IF_FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_MULTI_THREADED, IID_PPV_ARGS(&d2d1Factory)));
+
+	wil::com_ptr_nothrow<IWICImagingFactory> wicFactory;
+	RETURN_IF_FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&wicFactory)));
+
+	RETURN_IF_FAILED(wicFactory->CreateBitmap(width, height, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &_bitmap));
+
+	D2D1_RENDER_TARGET_PROPERTIES props{};
+	props.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	props.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+	RETURN_IF_FAILED(d2d1Factory->CreateWicBitmapRenderTarget(_bitmap.get(), props, &_renderTarget));
+
+	RETURN_IF_FAILED(CreateRenderTargetResources(width, height));
 	return S_OK;
 }
 
@@ -37,14 +57,26 @@ const bool FrameGenerator::HasD3DManager() const
 	return _texture != nullptr;
 }
 
-HRESULT FrameGenerator::SetD3DManager(IUnknown* manager, UINT width, UINT height)
+HRESULT FrameGenerator::SetD3DManager(IUnknown* manager)
 {
 	RETURN_HR_IF_NULL(E_POINTER, manager);
-	RETURN_HR_IF(E_INVALIDARG, !width || !height);
-
 	RETURN_IF_FAILED(manager->QueryInterface(&_dxgiManager));
 	RETURN_IF_FAILED(_dxgiManager->OpenDeviceHandle(&_deviceHandle));
+	_d3dManager = manager;
 
+	// force a rebuild on GPU at the next frame
+	_renderTarget.reset();
+	_texture.reset();
+	_bitmap.reset();
+	_converter.reset();
+	_phoneBitmap.reset();
+	_width = 0;
+	_height = 0;
+	return S_OK;
+}
+
+HRESULT FrameGenerator::CreateGpuResources(UINT width, UINT height)
+{
 	wil::com_ptr_nothrow<ID3D11Device> device;
 	RETURN_IF_FAILED(_dxgiManager->GetVideoService(_deviceHandle, IID_PPV_ARGS(&device)));
 
@@ -78,14 +110,6 @@ HRESULT FrameGenerator::SetD3DManager(IUnknown* manager, UINT width, UINT height
 	// create GPU RGB => NV12 converter
 	RETURN_IF_FAILED(CoCreateInstance(CLSID_VideoProcessorMFT, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&_converter)));
 
-	wil::com_ptr_nothrow<IMFAttributes> atts;
-	RETURN_IF_FAILED(_converter->GetAttributes(&atts));
-	TraceMFAttributes(atts.get(), L"VideoProcessorMFT");
-
-	MFT_OUTPUT_STREAM_INFO info{};
-	RETURN_IF_FAILED(_converter->GetOutputStreamInfo(0, &info));
-	WINTRACE(L"FrameGenerator::SetD3DManager CLSID_VideoProcessorMFT flags:0x%08X size:%u alignment:%u", info.dwFlags, info.cbSize, info.cbAlignment);
-
 	wil::com_ptr_nothrow<IMFMediaType> inputType;
 	RETURN_IF_FAILED(MFCreateMediaType(&inputType));
 	inputType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -101,7 +125,7 @@ HRESULT FrameGenerator::SetD3DManager(IUnknown* manager, UINT width, UINT height
 	RETURN_IF_FAILED(_converter->SetOutputType(0, outputType.get(), 0));
 
 	// make sure the video processor works on GPU
-	RETURN_IF_FAILED(_converter->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)manager));
+	RETURN_IF_FAILED(_converter->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, (ULONG_PTR)_d3dManager.get()));
 	return S_OK;
 }
 
@@ -133,6 +157,11 @@ HRESULT FrameGenerator::Generate(IMFSample* sample, REFGUID format, IMFSample** 
 	RETURN_HR_IF_NULL(E_POINTER, sample);
 	RETURN_HR_IF_NULL(E_POINTER, outSample);
 	*outSample = nullptr;
+
+	if (!_renderTarget && _requestedWidth && _requestedHeight)
+	{
+		RETURN_IF_FAILED(EnsureRenderTarget(_requestedWidth, _requestedHeight));
+	}
 
 	// render the latest phone frame (or a placeholder) - common to CPU & GPU
 	if (_renderTarget && _textFormat && _dwrite && _whiteBrush)
@@ -282,7 +311,15 @@ void FrameGenerator::EnsureSharedView()
 		return;
 
 	_lastOpenAttempt = now;
-	_sharedFile = CreateFileW(OVRA_SHARED_FILE, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	// read-write when allowed (the installer gives everyone modify rights on the folder), so we can
+	// tell the desktop app which size is being used; fall back to read-only
+	_sharedWritable = true;
+	_sharedFile = CreateFileW(OVRA_SHARED_FILE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (_sharedFile == INVALID_HANDLE_VALUE)
+	{
+		_sharedWritable = false;
+		_sharedFile = CreateFileW(OVRA_SHARED_FILE, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+	}
 	if (_sharedFile == INVALID_HANDLE_VALUE)
 		return;
 
@@ -293,14 +330,14 @@ void FrameGenerator::EnsureSharedView()
 		return;
 	}
 
-	_sharedMapping = CreateFileMappingW(_sharedFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+	_sharedMapping = CreateFileMappingW(_sharedFile, nullptr, _sharedWritable ? PAGE_READWRITE : PAGE_READONLY, 0, 0, nullptr);
 	if (!_sharedMapping)
 	{
 		CloseSharedView();
 		return;
 	}
 
-	_sharedView = (const BYTE*)MapViewOfFile(_sharedMapping, FILE_MAP_READ, 0, 0, OVRA_FILE_SIZE);
+	_sharedView = (const BYTE*)MapViewOfFile(_sharedMapping, _sharedWritable ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, OVRA_FILE_SIZE);
 	if (!_sharedView)
 	{
 		CloseSharedView();
@@ -310,9 +347,26 @@ void FrameGenerator::EnsureSharedView()
 }
 
 // returns true if there's a recent phone frame in _frameCopy
+void FrameGenerator::PublishRequestedSize(UINT width, UINT height)
+{
+	if (!_sharedView || !_sharedWritable)
+		return;
+
+	auto header = (OvraSharedHeader*)_sharedView;
+	if (header->magic != OVRA_MAGIC)
+		return;
+
+	FILETIME ft;
+	GetSystemTimeAsFileTime(&ft);
+	header->requestedWidth = width;
+	header->requestedHeight = height;
+	header->requestTime = ((LONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
 bool FrameGenerator::ReadSharedFrame()
 {
 	EnsureSharedView();
+	PublishRequestedSize(_width, _height);
 	if (_sharedView)
 	{
 		auto header = (const OvraSharedHeader*)_sharedView;

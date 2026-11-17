@@ -8,8 +8,8 @@
 #define OVRA_SHARED_FILE L"C:\\ProgramData\\OvraCam\\frame.bin"
 #define OVRA_MAGIC 0x4352564F // 'OVRC'
 #define OVRA_HEADER_SIZE 4096
-#define OVRA_MAX_WIDTH 1920
-#define OVRA_MAX_HEIGHT 1080
+#define OVRA_MAX_WIDTH 3840
+#define OVRA_MAX_HEIGHT 2160
 #define OVRA_FILE_SIZE (OVRA_HEADER_SIZE + OVRA_MAX_WIDTH * OVRA_MAX_HEIGHT * 4)
 #define OVRA_STALE_MS 1500 // after this without new frames, show the placeholder
 
@@ -25,5 +25,11 @@ struct OvraSharedHeader
 	volatile LONGLONG seq; // odd while the writer is writing
 	LONGLONG writeTime;    // FILETIME (UTC) of the last frame
 	UINT32 writerPid;
+	// written by the camera (Frame Server) while an app is using it, so the
+	// desktop app can produce frames at exactly the size being consumed
+	UINT32 requestedWidth;   // offset 44
+	UINT32 requestedHeight;  // offset 48
+	UINT32 reserved;         // offset 52
+	LONGLONG requestTime;    // offset 56, FILETIME (UTC)
 };
 #pragma pack(pop)

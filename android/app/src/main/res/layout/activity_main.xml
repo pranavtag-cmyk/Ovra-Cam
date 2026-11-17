@@ -4,10 +4,11 @@
     android:layout_height="match_parent"
     android:background="#000000">
 
-    <androidx.camera.view.PreviewView
+    <SurfaceView
         android:id="@+id/preview"
         android:layout_width="match_parent"
-        android:layout_height="match_parent" />
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
 
     <!-- top bar -->
     <LinearLayout
@@ -91,6 +92,18 @@
             android:textColor="#FFFFFF" />
 
         <Button
+            android:id="@+id/btnFocus"
+            style="?android:attr/borderlessButtonStyle"
+            android:layout_width="wrap_content"
+            android:layout_height="44dp"
+            android:layout_marginStart="10dp"
+            android:background="@drawable/btn_bg"
+            android:paddingHorizontal="18dp"
+            android:text="Focus: auto"
+            android:textAllCaps="false"
+            android:textColor="#FFFFFF" />
+
+        <Button
             android:id="@+id/btnDim"
             style="?android:attr/borderlessButtonStyle"
             android:layout_width="wrap_content"
@@ -98,7 +111,7 @@
             android:layout_marginStart="10dp"
             android:background="@drawable/btn_bg"
             android:paddingHorizontal="18dp"
-            android:text="Screen off (save battery)"
+            android:text="Screen off"
             android:textAllCaps="false"
             android:textColor="#FFFFFF" />
     </LinearLayout>

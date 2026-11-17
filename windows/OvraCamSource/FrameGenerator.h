@@ -20,6 +20,10 @@ class FrameGenerator
 	wil::com_ptr_nothrow<ID2D1SolidColorBrush> _accentBrush;
 	wil::com_ptr_nothrow<ID2D1SolidColorBrush> _dimBrush;
 	wil::com_ptr_nothrow<ID2D1Bitmap> _phoneBitmap;
+	wil::com_ptr_nothrow<IUnknown> _d3dManager;
+	UINT _requestedWidth;
+	UINT _requestedHeight;
+	bool _sharedWritable;
 	UINT _phoneBitmapWidth;
 	UINT _phoneBitmapHeight;
 
@@ -35,6 +39,8 @@ class FrameGenerator
 	ULONGLONG _lastFrameTime; // GetTickCount64 when a new frame was last seen
 
 	HRESULT CreateRenderTargetResources(UINT width, UINT height);
+	HRESULT CreateGpuResources(UINT width, UINT height);
+	void PublishRequestedSize(UINT width, UINT height);
 	void EnsureSharedView();
 	void CloseSharedView();
 	bool ReadSharedFrame();
@@ -49,6 +55,9 @@ public:
 		_fps(0),
 		_deviceHandle(nullptr),
 		_prevTime(MFGetSystemTime()),
+		_requestedWidth(0),
+		_requestedHeight(0),
+		_sharedWritable(false),
 		_phoneBitmapWidth(0),
 		_phoneBitmapHeight(0),
 		_sharedFile(INVALID_HANDLE_VALUE),
@@ -76,7 +85,7 @@ public:
 		}
 	}
 
-	HRESULT SetD3DManager(IUnknown* manager, UINT width, UINT height);
+	HRESULT SetD3DManager(IUnknown* manager);
 	const bool HasD3DManager() const;
 	HRESULT EnsureRenderTarget(UINT width, UINT height);
 	HRESULT Generate(IMFSample* sample, REFGUID format, IMFSample** outSample);

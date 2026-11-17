@@ -15,12 +15,12 @@ namespace OvraCam
         public const string FilePath = @"C:\ProgramData\OvraCam\frame.bin";
         public const uint Magic = 0x4352564F; // 'OVRC'
         public const int HeaderSize = 4096;
-        public const int MaxWidth = 1920;
-        public const int MaxHeight = 1080;
+        public const int MaxWidth = 3840;
+        public const int MaxHeight = 2160;
         public const long FileSize = HeaderSize + (long)MaxWidth * MaxHeight * 4;
 
         // header offsets (see OvraShared.h)
-        private const int OffMagic = 0, OffVersion = 4, OffWidth = 8, OffHeight = 12, OffStride = 16, OffFlags = 20, OffSeq = 24, OffTime = 32, OffPid = 40;
+        private const int OffMagic = 0, OffVersion = 4, OffWidth = 8, OffHeight = 12, OffStride = 16, OffFlags = 20, OffSeq = 24, OffTime = 32, OffPid = 40, OffReqW = 44, OffReqH = 48, OffReqTime = 56;
 
         private FileStream _stream;
         private MemoryMappedFile _mmf;
@@ -74,6 +74,26 @@ namespace OvraCam
                 }
                 *(long*)(_ptr + OffTime) = DateTime.UtcNow.ToFileTimeUtc();
                 Interlocked.Exchange(ref *seqPtr, ++_seq); // even => done
+            }
+        }
+
+        /// <summary>The size an app (Teams, OBS...) is currently pulling from the camera, or null if none.</summary>
+        public (int width, int height)? GetRequestedSize()
+        {
+            lock (_lock)
+            {
+                if (_ptr == null) return null;
+                int w = (int)*(uint*)(_ptr + OffReqW);
+                int h = (int)*(uint*)(_ptr + OffReqH);
+                long t = *(long*)(_ptr + OffReqTime);
+                if (w <= 0 || h <= 0 || t <= 0) return null;
+                try
+                {
+                    var age = DateTime.UtcNow - DateTime.FromFileTimeUtc(t);
+                    if (age > TimeSpan.FromSeconds(3) || age < TimeSpan.FromSeconds(-60)) return null;
+                }
+                catch { return null; }
+                return (w, h);
             }
         }
 

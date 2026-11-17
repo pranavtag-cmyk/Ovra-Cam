@@ -1,7 +1,6 @@
 package com.ovra.cam
 
 import android.Manifest
-import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.hardware.display.DisplayManager
 import android.os.BatteryManager
@@ -10,56 +9,41 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
-import android.util.Size
-import android.view.MotionEvent
+import android.view.Surface
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.Camera
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.FocusMeteringAction
-import androidx.camera.core.ImageAnalysis
-import androidx.camera.core.Preview
-import androidx.camera.core.resolutionselector.AspectRatioStrategy
-import androidx.camera.core.resolutionselector.ResolutionSelector
-import androidx.camera.core.resolutionselector.ResolutionStrategy
-import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import org.json.JSONArray
 import org.json.JSONObject
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : AppCompatActivity(), CameraEngine.Listener {
 
-    private lateinit var previewView: PreviewView
+    private lateinit var previewView: SurfaceView
     private lateinit var statusText: TextView
     private lateinit var infoText: TextView
     private lateinit var btnSwitch: Button
     private lateinit var btnTorch: Button
+    private lateinit var btnFocus: Button
     private lateinit var btnDim: Button
     private lateinit var dimOverlay: View
 
     private val main = Handler(Looper.getMainLooper())
-    private lateinit var analysisExecutor: ExecutorService
-    private var cameraProvider: ProcessCameraProvider? = null
-    private var camera: Camera? = null
-    private var analysis: ImageAnalysis? = null
-
-    private var useFront = false
-    private var torchOn = false
-    private var res = "720p"
-    private var dimmed = false
-    private var lastFrameNs = 0L
-    private val encoder = JpegEncoder()
-
+    private lateinit var engine: CameraEngine
     private lateinit var server: StreamServer
     private lateinit var beacon: Beacon
-    private var pcAddress: String? = null
+
+    private var surfaceReady = false
+    private var wantFront = false
+    private var wantRes = "1080p"
+    private var dimmed = false
 
     private val deviceName: String by lazy {
         val user = try { Settings.Global.getString(contentResolver, Settings.Global.DEVICE_NAME) } catch (_: Exception) { null }
@@ -74,10 +58,7 @@ class MainActivity : AppCompatActivity() {
     private val displayListener = object : DisplayManager.DisplayListener {
         override fun onDisplayAdded(displayId: Int) {}
         override fun onDisplayRemoved(displayId: Int) {}
-        override fun onDisplayChanged(displayId: Int) {
-            val rotation = previewView.display?.rotation ?: return
-            analysis?.targetRotation = rotation
-        }
+        override fun onDisplayChanged(displayId: Int) { updateDisplayRotation() }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,29 +72,49 @@ class MainActivity : AppCompatActivity() {
         infoText = findViewById(R.id.info)
         btnSwitch = findViewById(R.id.btnSwitch)
         btnTorch = findViewById(R.id.btnTorch)
+        btnFocus = findViewById(R.id.btnFocus)
         btnDim = findViewById(R.id.btnDim)
         dimOverlay = findViewById(R.id.dimOverlay)
 
-        previewView.implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-        analysisExecutor = Executors.newSingleThreadExecutor()
+        val prefs = getPreferences(MODE_PRIVATE)
+        wantFront = prefs.getBoolean("front", false)
+        wantRes = prefs.getString("res", "1080p") ?: "1080p"
 
-        btnSwitch.setOnClickListener { switchCamera() }
-        btnTorch.setOnClickListener { setTorch(!torchOn) }
-        btnDim.setOnClickListener { setDimmed(true) }
-        dimOverlay.setOnClickListener { setDimmed(false) }
-        setupTapToFocus()
-
-        server = StreamServer(PORT, ::onCommand) { connected, address ->
-            main.post { onClientChanged(connected, address) }
-        }
+        engine = CameraEngine(this, this)
+        server = StreamServer(PORT, ::onCommand,
+            onClientChanged = { connected, address -> main.post { onClientChanged(connected, address) } },
+            onNeedKeyframe = { engine.requestKeyframe() })
         server.start()
         beacon = Beacon(deviceName, PORT)
         beacon.start()
 
-        (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, main)
+        btnSwitch.setOnClickListener { switchCamera() }
+        btnTorch.setOnClickListener { engine.setTorch(!engine.torch) }
+        btnFocus.setOnClickListener { if (engine.focusLocked) engine.autoFocus() else engine.lockFocus() }
+        btnDim.setOnClickListener { setDimmed(true) }
+        dimOverlay.setOnClickListener { setDimmed(false) }
+        previewView.setOnClickListener { engine.refocus() }
 
-        if (hasCameraPermission()) startCamera()
-        else ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1)
+        previewView.holder.setFixedSize(1920, 1080)
+        previewView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(holder: SurfaceHolder) {
+                surfaceReady = true
+                startCameraIfReady()
+            }
+            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) {
+                surfaceReady = false
+                engine.stop()
+            }
+        })
+        findViewById<View>(android.R.id.content).addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitPreview() }
+
+        (getSystemService(DISPLAY_SERVICE) as DisplayManager).registerDisplayListener(displayListener, main)
+        updateDisplayRotation()
+
+        if (!hasCameraPermission()) {
+            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.CAMERA), 1)
+        }
 
         updateInfo()
         main.postDelayed(statusTick, 5000)
@@ -125,7 +126,7 @@ class MainActivity : AppCompatActivity() {
         (getSystemService(DISPLAY_SERVICE) as DisplayManager).unregisterDisplayListener(displayListener)
         server.stop()
         beacon.stop()
-        analysisExecutor.shutdown()
+        engine.release()
     }
 
     override fun onResume() {
@@ -141,117 +142,59 @@ class MainActivity : AppCompatActivity() {
                 or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION)
     }
 
+    /** Keep the preview 16:9 and centred. */
+    private fun fitPreview() {
+        val root = findViewById<View>(android.R.id.content)
+        val w = root.width
+        val h = root.height
+        if (w == 0 || h == 0) return
+        var pw = w
+        var ph = w * 9 / 16
+        if (ph > h) { ph = h; pw = h * 16 / 9 }
+        val lp = previewView.layoutParams as FrameLayout.LayoutParams
+        if (lp.width != pw || lp.height != ph) {
+            lp.width = pw
+            lp.height = ph
+            previewView.layoutParams = lp
+        }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun updateDisplayRotation() {
+        val r = (if (Build.VERSION.SDK_INT >= 30) display?.rotation else windowManager.defaultDisplay.rotation) ?: Surface.ROTATION_90
+        engine.displayRotationDegrees = when (r) {
+            Surface.ROTATION_90 -> 90
+            Surface.ROTATION_180 -> 180
+            Surface.ROTATION_270 -> 270
+            else -> 0
+        }
+    }
+
     private fun hasCameraPermission() =
         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (hasCameraPermission()) startCamera()
+        if (hasCameraPermission()) startCameraIfReady()
         else {
             statusText.text = "Camera permission needed"
             Toast.makeText(this, "Ovra Cam needs camera access to work as a webcam", Toast.LENGTH_LONG).show()
         }
     }
 
-    // ---------------- camera ----------------
-
-    private fun startCamera() {
-        val future = ProcessCameraProvider.getInstance(this)
-        future.addListener({
-            cameraProvider = future.get()
-            bindCamera()
-        }, ContextCompat.getMainExecutor(this))
-    }
-
-    private fun targetSize(): Size = if (res == "1080p") Size(1920, 1080) else Size(1280, 720)
-
-    private fun bindCamera() {
-        val provider = cameraProvider ?: return
-        provider.unbindAll()
-
-        val selector = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-        if (!provider.hasCamera(selector)) {
-            useFront = !useFront
-        }
-        val finalSelector = if (useFront) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-
-        val resolution = ResolutionSelector.Builder()
-            .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY)
-            .setResolutionStrategy(ResolutionStrategy(targetSize(), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
-            .build()
-
-        val preview = Preview.Builder()
-            .setResolutionSelector(ResolutionSelector.Builder()
-                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY).build())
-            .build()
-            .also { it.setSurfaceProvider(previewView.surfaceProvider) }
-
-        val rotation = previewView.display?.rotation ?: windowManager.defaultDisplay.rotation
-        val imageAnalysis = ImageAnalysis.Builder()
-            .setResolutionSelector(resolution)
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-            .setTargetRotation(rotation)
-            .build()
-        imageAnalysis.setAnalyzer(analysisExecutor) { image ->
-            try {
-                val now = System.nanoTime()
-                // only encode when a PC is connected, and cap at ~30 fps
-                if (server.hasClient && now - lastFrameNs >= 31_000_000L) {
-                    lastFrameNs = now
-                    val quality = if (res == "1080p") 75 else 80
-                    val jpeg = encoder.encode(image, quality)
-                    val flags = if (useFront) 1 else 0
-                    server.sendFrame(jpeg, image.imageInfo.rotationDegrees, flags)
-                }
-            } catch (_: Exception) {
-            } finally {
-                image.close()
-            }
-        }
-        analysis = imageAnalysis
-
-        try {
-            camera = provider.bindToLifecycle(this, finalSelector, preview, imageAnalysis)
-            torchOn = false
-            updateTorchUi()
-            sendStatus()
-        } catch (e: Exception) {
-            statusText.text = "Camera error: ${e.message}"
-        }
+    private fun startCameraIfReady() {
+        if (!surfaceReady || !hasCameraPermission()) return
+        engine.start(previewView.holder.surface, wantFront, wantRes)
     }
 
     private fun switchCamera() {
-        useFront = !useFront
-        bindCamera()
+        wantFront = !engine.front
+        savePrefs()
+        startCameraIfReady()
     }
 
-    private fun setTorch(on: Boolean) {
-        val cam = camera ?: return
-        if (!cam.cameraInfo.hasFlashUnit()) return
-        cam.cameraControl.enableTorch(on)
-        torchOn = on
-        updateTorchUi()
-        sendStatus()
-    }
-
-    private fun updateTorchUi() {
-        val has = camera?.cameraInfo?.hasFlashUnit() == true
-        btnTorch.isEnabled = has
-        btnTorch.alpha = if (has) 1f else 0.4f
-        btnTorch.text = if (torchOn) "Light on" else "Light off"
-    }
-
-    @SuppressLint("ClickableViewAccessibility")
-    private fun setupTapToFocus() {
-        previewView.setOnTouchListener { v, event ->
-            if (event.action == MotionEvent.ACTION_UP) {
-                val point = previewView.meteringPointFactory.createPoint(event.x, event.y)
-                camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(point).build())
-                v.performClick()
-            }
-            true
-        }
+    private fun savePrefs() {
+        getPreferences(MODE_PRIVATE).edit().putBoolean("front", wantFront).putString("res", wantRes).apply()
     }
 
     private fun setDimmed(on: Boolean) {
@@ -262,33 +205,65 @@ class MainActivity : AppCompatActivity() {
         window.attributes = lp
     }
 
+    // ---------------- CameraEngine.Listener ----------------
+
+    override fun onVideo(data: ByteArray, rotation: Int, flags: Int) {
+        server.sendVideo(data, rotation, flags)
+    }
+
+    override fun onStateChanged() {
+        main.post {
+            btnTorch.isEnabled = engine.hasFlash
+            btnTorch.alpha = if (engine.hasFlash) 1f else 0.4f
+            btnTorch.text = if (engine.torch) "Light on" else "Light off"
+            btnFocus.text = if (engine.focusLocked) "Focus: locked" else "Focus: auto"
+            sendStatus()
+        }
+    }
+
+    override fun onError(message: String) {
+        main.post {
+            statusText.text = message
+            statusText.setTextColor(0xFFFF6B6B.toInt())
+            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+        }
+    }
+
     // ---------------- PC link ----------------
 
     private fun onCommand(cmd: JSONObject) {
         main.post {
             when (cmd.optString("cmd")) {
                 "switch" -> switchCamera()
-                "torch" -> setTorch(cmd.optBoolean("on"))
+                "front" -> if (!engine.front) switchCamera()
+                "back" -> if (engine.front) switchCamera()
+                "torch" -> engine.setTorch(cmd.optBoolean("on"))
+                "keyframe" -> engine.requestKeyframe()
                 "res" -> {
                     val v = cmd.optString("value")
-                    if ((v == "720p" || v == "1080p") && v != res) {
-                        res = v
-                        bindCamera()
+                    if (v in listOf("720p", "1080p", "4k") && v != engine.resolution) {
+                        wantRes = v
+                        savePrefs()
+                        startCameraIfReady()
                     } else sendStatus()
                 }
-                "front" -> { if (!useFront) switchCamera() }
-                "back" -> { if (useFront) switchCamera() }
+                "focus" -> when (cmd.optString("mode")) {
+                    "lock" -> engine.lockFocus()
+                    "auto" -> engine.autoFocus()
+                    "refocus" -> engine.refocus()
+                    "manual" -> engine.setManualFocus(cmd.optDouble("value", 0.0))
+                }
                 "hello" -> sendStatus()
             }
         }
     }
 
     private fun onClientChanged(connected: Boolean, address: String?) {
-        pcAddress = if (connected) address else null
         if (connected) {
-            val via = if (address == "127.0.0.1" || address == "::1" || address?.startsWith("::ffff:127.") == true) "USB" else "Wi-Fi"
+            val via = if (address == "127.0.0.1" || address == "::1" || address?.contains("127.0.0.1") == true) "USB" else "Wi-Fi"
             statusText.text = "Streaming to PC · $via"
             statusText.setTextColor(0xFF3DDC97.toInt())
+            server.primeWithConfig(engine.config, engine.rotation, if (engine.front) 1 else 0)
             sendStatus()
         } else {
             statusText.text = "Waiting for your PC"
@@ -305,11 +280,15 @@ class MainActivity : AppCompatActivity() {
         if (!::server.isInitialized) return
         val json = JSONObject()
             .put("device", deviceName)
-            .put("camera", if (useFront) "front" else "back")
-            .put("torch", torchOn)
-            .put("hasTorch", camera?.cameraInfo?.hasFlashUnit() == true)
-            .put("res", res)
+            .put("camera", if (engine.front) "front" else "back")
+            .put("torch", engine.torch)
+            .put("hasTorch", engine.hasFlash)
+            .put("res", engine.resolution)
+            .put("resolutions", JSONArray(engine.supportedResolutions()))
             .put("battery", battery())
+            .put("focusLocked", engine.focusLocked)
+            .put("focus", engine.focusValue)
+            .put("canManualFocus", engine.canManualFocus)
         server.sendStatus(json)
     }
 
@@ -317,7 +296,7 @@ class MainActivity : AppCompatActivity() {
         override fun run() {
             if (server.hasClient) sendStatus()
             updateInfo()
-            main.postDelayed(this, 5000)
+            main.postDelayed(this, 3000)
         }
     }
 

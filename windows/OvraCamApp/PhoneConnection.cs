@@ -18,12 +18,17 @@ namespace OvraCam
         public bool hasTorch { get; set; }
         public string res { get; set; }
         public int battery { get; set; } = -1;
+        public string[] resolutions { get; set; }
+        public bool focusLocked { get; set; }
+        public double focus { get; set; }          // 0 = far (infinity) .. 1 = closest
+        public bool canManualFocus { get; set; }
     }
 
     /// <summary>
     /// TCP link to the phone. Phone -> PC packets: [type:1][len:4 BE][payload].
     ///   type 1 = video frame: [rotation:2 BE][flags:1][jpeg bytes]
     ///   type 2 = status JSON (UTF-8)
+    ///   type 3 = H.264 video: [rotation:2 BE][flags:1 (1=front, 2=keyframe, 4=codec config)][Annex B data]
     /// PC -> phone: one JSON command per line, e.g. {"cmd":"switch"}.
     /// </summary>
     internal sealed class PhoneConnection : IDisposable
@@ -40,7 +45,7 @@ namespace OvraCam
         public string Via { get; }   // "USB" or "Wi-Fi"
         public bool Connected => _client?.Connected == true;
 
-        public event Action<byte[], int, int> FrameReceived;   // jpeg, rotation, flags
+        public event Action<int, byte[], int, int> FrameReceived;   // type, data, rotation, flags
         public event Action<PhoneStatus> StatusReceived;
         public event Action<string> Disconnected;
 
@@ -63,7 +68,7 @@ namespace OvraCam
             // over USB, adb accepts the local connection even if the phone app isn't listening:
             // the read loop will then end quickly and report a disconnect.
             _ = Task.Run(() => ReadLoop(_cts.Token));
-            Send(new { cmd = "hello", client = "Ovra Cam for Windows", version = 1 });
+            Send(new { cmd = "hello", client = "Ovra Cam for Windows", version = 2 });
         }
 
         private static async Task ReadExactAsync(Stream s, byte[] buf, int count, CancellationToken ct)
@@ -92,13 +97,13 @@ namespace OvraCam
                     var payload = new byte[len];
                     await ReadExactAsync(_stream, payload, len, ct);
 
-                    if (type == 1 && len > 3)
+                    if ((type == 1 || type == 3) && len > 3)
                     {
                         int rotation = (payload[0] << 8) | payload[1];
                         int flags = payload[2];
-                        var jpeg = new byte[len - 3];
-                        Buffer.BlockCopy(payload, 3, jpeg, 0, jpeg.Length);
-                        FrameReceived?.Invoke(jpeg, rotation, flags);
+                        var data = new byte[len - 3];
+                        Buffer.BlockCopy(payload, 3, data, 0, data.Length);
+                        FrameReceived?.Invoke(type, data, rotation, flags);
                     }
                     else if (type == 2)
                     {

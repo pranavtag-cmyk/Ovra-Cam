@@ -8,7 +8,7 @@ namespace OvraCam
     {
         public int ExtraRotation { get; set; }          // 0, 90, 180, 270 (on top of the phone's own)
         public bool Mirror { get; set; }
-        public string Quality { get; set; } = "720p";   // 720p or 1080p
+        public string Quality { get; set; } = "1080p";  // 720p, 1080p or 4k
         public string LastIp { get; set; } = "";
         public bool AutoConnect { get; set; } = true;
         public bool StartWithWindows { get; set; }

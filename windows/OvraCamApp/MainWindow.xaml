@@ -95,6 +95,23 @@
                             <Button x:Name="QualityBtn" Style="{StaticResource Btn}" Content="Quality: 720p" Click="QualityBtn_Click"/>
                             <Button x:Name="RotateBtn" Grid.Column="2" Style="{StaticResource Btn}" Content="Rotate" Click="RotateBtn_Click"/>
                         </Grid>
+                        <Grid Margin="0,10,0,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/>
+                                <ColumnDefinition Width="10"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
+                            <Button x:Name="FocusBtn" Style="{StaticResource Btn}" Content="Focus: auto" Click="FocusBtn_Click" IsEnabled="False" ToolTip="Lock focus at its current distance, so it stops hunting"/>
+                            <Button x:Name="RefocusBtn" Grid.Column="2" Style="{StaticResource Btn}" Content="Refocus" Click="RefocusBtn_Click" IsEnabled="False" ToolTip="Focus on the centre once, then keep it locked"/>
+                        </Grid>
+                        <StackPanel x:Name="FocusPanel" Margin="0,10,0,0" Visibility="Collapsed">
+                            <Grid>
+                                <TextBlock Text="Far" Foreground="{StaticResource Dim}" FontSize="11"/>
+                                <TextBlock Text="Focus distance" Foreground="{StaticResource Dim}" FontSize="11" HorizontalAlignment="Center"/>
+                                <TextBlock Text="Near" Foreground="{StaticResource Dim}" FontSize="11" HorizontalAlignment="Right"/>
+                            </Grid>
+                            <Slider x:Name="FocusSlider" Minimum="0" Maximum="1" SmallChange="0.01" LargeChange="0.05" Margin="0,4,0,0" ValueChanged="FocusSlider_ValueChanged"/>
+                        </StackPanel>
                         <CheckBox x:Name="MirrorBox" Content="Mirror video" Margin="0,10,0,0" Checked="Option_Changed" Unchecked="Option_Changed"/>
 
                         <TextBlock Style="{StaticResource Section}" Text="APP"/>

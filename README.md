@@ -20,7 +20,7 @@ Every push to `main` builds both apps with GitHub Actions and publishes them und
 
 ## How it works
 ```
-Phone (CameraX → JPEG) ──TCP 5150 (USB via adb forward, or Wi-Fi)──► OvraCam.exe (decode, rotate)
+Phone (Camera2 → hardware H.264) ──TCP 5150 (USB via adb forward, or Wi-Fi)──► OvraCam.exe (H.264 decode via Media Foundation, rotate)
                                                                          │ writes frames to C:\ProgramData\OvraCam\frame.bin
                                                                          ▼
                                     OvraCamSource.dll (Media Foundation virtual camera, loaded by Windows Frame Server)
@@ -32,4 +32,4 @@ Phone (CameraX → JPEG) ──TCP 5150 (USB via adb forward, or Wi-Fi)──►
 - `windows/OvraCamSource/` - C++ virtual camera, based on [VCamSample](https://github.com/smourier/VCamSample) by Simon Mourier (MIT)
 - `windows/installer/` - Inno Setup script
 
-The camera outputs 1280×720 at 30 fps. Ports: TCP 5150 (video), UDP 5151 (phone discovery).
+The camera offers 1920×1080 (default), 1280×720 and 3840×2160 (4K) at 30 fps; the phone streams 720p, 1080p or 4K. Focus can be locked, refocused or set manually from either device. Ports: TCP 5150 (video), UDP 5151 (phone discovery).

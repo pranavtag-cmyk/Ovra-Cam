@@ -139,7 +139,8 @@ extern "C" __declspec(dllexport) HRESULT __stdcall OvraCam_Start(LPCWSTR friendl
 		_ovraMfStarted = true;
 	}
 
-	auto clsid = GUID_ToStringW(CLSID_VCam);
+	// must be the "{xxxxxxxx-...}" form (resolve=false), not the friendly name
+	auto clsid = GUID_ToStringW(CLSID_VCam, false);
 	wil::com_ptr_nothrow<IMFVirtualCamera> cam;
 	RETURN_IF_FAILED_MSG(MFCreateVirtualCamera(
 		MFVirtualCameraType_SoftwareCameraSource,

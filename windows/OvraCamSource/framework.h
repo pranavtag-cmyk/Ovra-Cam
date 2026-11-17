@@ -52,6 +52,9 @@
 #include "wintrace.h"
 
 #pragma comment(lib, "mfsensorgroup")
+#pragma comment(lib, "mfplat")
+#pragma comment(lib, "mfuuid")
+#pragma comment(lib, "ole32")
 // Ovra Cam media source CLSID: 9b7e3c41-6a2d-4f58-b0e3-2c5d8f1a7e64
 extern GUID CLSID_VCam;
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -45,20 +46,24 @@ namespace OvraCam
         private PhoneStatus _phoneStatus;
         private readonly HashSet<string> _autoLaunched = new HashSet<string>();
 
-        // frame pipeline: reader thread drops frames into a single slot, decoder takes the newest
-        private readonly object _slotLock = new object();
-        private byte[] _slotJpeg;
-        private int _slotRotation;
-        private readonly AutoResetEvent _slotEvent = new AutoResetEvent(false);
+        // video pipeline: the network thread queues H.264 packets, the decoder thread decodes them in order
+        private sealed class Packet { public byte[] Data; public int Rotation; public int Flags; }
+        private readonly ConcurrentQueue<Packet> _packets = new ConcurrentQueue<Packet>();
+        private readonly AutoResetEvent _packetEvent = new AutoResetEvent(false);
+        private volatile bool _resetDecoder;
         private Thread _decoder;
         private volatile bool _decoderRun = true;
         private byte[] _pixels = Array.Empty<byte>();
+        private byte[] _previewPixels = Array.Empty<byte>();
         private WriteableBitmap _previewBitmap;
         private int _previewPending;
         private int _frameCount;
         private readonly Stopwatch _fpsWatch = Stopwatch.StartNew();
         private double _fps;
         private DateTime _lastFrameUtc = DateTime.MinValue;
+        private string _videoSize = "";
+        private bool _focusSliderUpdating;
+        private DateTime _focusSliderTouched = DateTime.MinValue;
 
         public MainWindow()
         {
@@ -76,7 +81,7 @@ namespace OvraCam
             MirrorBox.IsChecked = _settings.Mirror;
             StartupBox.IsChecked = _settings.StartWithWindows;
             IpBox.Text = _settings.LastIp;
-            QualityBtn.Content = "Quality: " + _settings.Quality;
+            QualityBtn.Content = "Quality: " + QualityLabel(_settings.Quality);
             _loadingUi = false;
 
             SetupTray();
@@ -100,7 +105,7 @@ namespace OvraCam
 
             _discovery.Start();
             _decoder = new Thread(DecoderLoop) { IsBackground = true, Name = "OvraCam decoder" };
-            _decoder.SetApartmentState(ApartmentState.STA);
+            _decoder.SetApartmentState(ApartmentState.MTA);
             _decoder.Start();
 
             _scanTimer.Tick += async (s, a) => await ScanAsync();
@@ -166,7 +171,7 @@ namespace OvraCam
             _uiTimer.Stop();
             Disconnect(null);
             _decoderRun = false;
-            _slotEvent.Set();
+            _packetEvent.Set();
             _discovery.Dispose();
             if (_camRunning)
             {
@@ -364,6 +369,8 @@ namespace OvraCam
                     return;
                 }
 
+                ClearPackets();
+                _resetDecoder = true;
                 _conn = conn;
                 _connKey = p.Key;
                 _lastFrameUtc = DateTime.UtcNow;
@@ -414,6 +421,10 @@ namespace OvraCam
             SwitchBtn.IsEnabled = false;
             TorchBtn.IsEnabled = false;
             TorchBtn.Content = "Light: off";
+            FocusBtn.IsEnabled = false;
+            RefocusBtn.IsEnabled = false;
+            FocusBtn.Content = "Focus: auto";
+            FocusPanel.Visibility = Visibility.Collapsed;
             FpsBadge.Visibility = Visibility.Collapsed;
             Preview.Source = null;
             _previewBitmap = null;
@@ -446,6 +457,24 @@ namespace OvraCam
             SetPhoneStatus(true, $"{st.device} · {cam} · over {_conn?.Via}{batt}");
             TorchBtn.IsEnabled = st.hasTorch;
             TorchBtn.Content = st.torch ? "Light: on" : "Light: off";
+
+            FocusBtn.IsEnabled = true;
+            RefocusBtn.IsEnabled = true;
+            FocusBtn.Content = st.focusLocked ? "Focus: locked" : "Focus: auto";
+            FocusPanel.Visibility = st.focusLocked && st.canManualFocus ? Visibility.Visible : Visibility.Collapsed;
+            if ((DateTime.UtcNow - _focusSliderTouched).TotalSeconds > 2)
+            {
+                _focusSliderUpdating = true;
+                FocusSlider.Value = Math.Max(0, Math.Min(1, st.focus));
+                _focusSliderUpdating = false;
+            }
+
+            // keep the quality the user picked, if this phone supports it
+            if (st.resolutions != null && st.resolutions.Length > 0 && Array.IndexOf(st.resolutions, _settings.Quality) < 0)
+            {
+                _settings.Quality = st.resolutions.Contains("1080p") ? "1080p" : st.resolutions[0];
+                QualityBtn.Content = "Quality: " + QualityLabel(_settings.Quality);
+            }
             if (!string.IsNullOrEmpty(st.res) && st.res != _settings.Quality)
             {
                 SendSettingsToPhone();
@@ -467,12 +496,35 @@ namespace OvraCam
             _conn?.Send(new { cmd = "torch", on });
         }
 
+        private static string QualityLabel(string q) => q == "4k" ? "4K" : q;
+
         private void QualityBtn_Click(object sender, RoutedEventArgs e)
         {
-            _settings.Quality = _settings.Quality == "720p" ? "1080p" : "720p";
-            QualityBtn.Content = "Quality: " + _settings.Quality;
+            var options = _phoneStatus?.resolutions;
+            if (options == null || options.Length == 0) options = new[] { "720p", "1080p" };
+            int i = Array.IndexOf(options, _settings.Quality);
+            _settings.Quality = options[(i + 1) % options.Length];
+            QualityBtn.Content = "Quality: " + QualityLabel(_settings.Quality);
             _settings.Save();
             SendSettingsToPhone();
+        }
+
+        private void FocusBtn_Click(object sender, RoutedEventArgs e)
+        {
+            bool locked = _phoneStatus?.focusLocked == true;
+            _conn?.Send(new { cmd = "focus", mode = locked ? "auto" : "lock" });
+        }
+
+        private void RefocusBtn_Click(object sender, RoutedEventArgs e)
+        {
+            _conn?.Send(new { cmd = "focus", mode = "refocus" });
+        }
+
+        private void FocusSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (_focusSliderUpdating) return;
+            _focusSliderTouched = DateTime.UtcNow;
+            _conn?.Send(new { cmd = "focus", mode = "manual", value = Math.Round(FocusSlider.Value, 3) });
         }
 
         private void RotateBtn_Click(object sender, RoutedEventArgs e)
@@ -509,106 +561,157 @@ namespace OvraCam
 
         // ---------------- video pipeline ----------------
 
-        private void OnFrame(byte[] jpeg, int rotation, int flags)
+        private void ClearPackets()
         {
-            lock (_slotLock)
+            while (_packets.TryDequeue(out _)) { }
+        }
+
+        private void OnFrame(int type, byte[] data, int rotation, int flags)
+        {
+            if (type != 3) return; // only H.264 (phone app v2+)
+            if (_packets.Count > 120)
             {
-                _slotJpeg = jpeg;
-                _slotRotation = rotation;
+                // the PC can't keep up: drop the backlog and restart from the next keyframe
+                ClearPackets();
+                _resetDecoder = true;
+                _conn?.Send(new { cmd = "keyframe" });
             }
-            _slotEvent.Set();
+            _packets.Enqueue(new Packet { Data = data, Rotation = rotation, Flags = flags });
+            _packetEvent.Set();
         }
 
         private void DecoderLoop()
         {
+            IntPtr dec = IntPtr.Zero;
+            byte[] config = null;
+            bool waitKey = true;
+            int errors = 0;
+            long ts = 0;
+            DateTime lastKeyRequest = DateTime.MinValue;
+
+            void RequestKey()
+            {
+                if ((DateTime.UtcNow - lastKeyRequest).TotalSeconds > 1)
+                {
+                    lastKeyRequest = DateTime.UtcNow;
+                    _conn?.Send(new { cmd = "keyframe" });
+                }
+            }
+
             while (_decoderRun)
             {
-                _slotEvent.WaitOne(500);
-                byte[] jpeg; int rotation;
-                lock (_slotLock)
-                {
-                    jpeg = _slotJpeg;
-                    rotation = _slotRotation;
-                    _slotJpeg = null;
-                }
-                if (jpeg == null || !_decoderRun) continue;
+                _packetEvent.WaitOne(500);
+                if (!_decoderRun) break;
 
                 try
                 {
-                    ProcessFrame(jpeg, rotation);
+                    if (_resetDecoder)
+                    {
+                        _resetDecoder = false;
+                        if (dec != IntPtr.Zero) { NativeMethods.OvraDec_Destroy(dec); dec = IntPtr.Zero; }
+                        waitKey = true;
+                        errors = 0;
+                        if (_conn != null) RequestKey();
+                    }
+
+                    int produced = 0;
+                    int rotation = 0;
+                    while (_packets.TryDequeue(out var p))
+                    {
+                        if ((p.Flags & 4) != 0)
+                        {
+                            // SPS/PPS: (re)start the decoder with the new stream settings
+                            config = p.Data;
+                            if (dec != IntPtr.Zero) NativeMethods.OvraDec_Destroy(dec);
+                            dec = NativeMethods.OvraDec_Create();
+                            if (dec != IntPtr.Zero) NativeMethods.OvraDec_Decode(dec, config, config.Length, ts);
+                            waitKey = true;
+                            continue;
+                        }
+
+                        if (dec == IntPtr.Zero)
+                        {
+                            if (config == null) { RequestKey(); continue; }
+                            dec = NativeMethods.OvraDec_Create();
+                            if (dec == IntPtr.Zero) continue;
+                            NativeMethods.OvraDec_Decode(dec, config, config.Length, ts);
+                            waitKey = true;
+                        }
+
+                        bool key = (p.Flags & 2) != 0;
+                        if (waitKey && !key) { RequestKey(); continue; }
+                        waitKey = false;
+
+                        ts += 333333;
+                        int n = NativeMethods.OvraDec_Decode(dec, p.Data, p.Data.Length, ts);
+                        if (n > 0) { produced += n; errors = 0; rotation = p.Rotation; }
+                        else if (n < 0 && ++errors > 30) { errors = 0; waitKey = true; RequestKey(); }
+                    }
+
+                    if (produced > 0)
+                    {
+                        Interlocked.Add(ref _frameCount, produced);
+                        RenderOutput(dec, rotation);
+                    }
                 }
+                catch (DllNotFoundException) { break; }
+                catch (EntryPointNotFoundException) { break; }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine("frame error: " + ex.Message);
+                    Debug.WriteLine("decode error: " + ex.Message);
                 }
             }
+
+            if (dec != IntPtr.Zero) NativeMethods.OvraDec_Destroy(dec);
         }
 
-        private void ProcessFrame(byte[] jpeg, int rotation)
+        private void RenderOutput(IntPtr dec, int phoneRotation)
         {
-            BitmapSource src;
-            using (var ms = new MemoryStream(jpeg))
+            int rot = ((phoneRotation + _settings.ExtraRotation) % 360 + 360) % 360;
+            int mirror = _settings.Mirror ? 1 : 0;
+
+            // render exactly the size the meeting app / OBS is using (or 1080p if nobody is using the camera yet)
+            var req = _writer?.GetRequestedSize();
+            int tw = req?.width ?? 1920, th = req?.height ?? 1080;
+            int cap = SharedFrameWriter.MaxWidth * SharedFrameWriter.MaxHeight * 4;
+            if (_pixels.Length != cap) _pixels = new byte[cap];
+            if (NativeMethods.OvraDec_Render(dec, _pixels, _pixels.Length, rot, mirror, tw, th, out int w, out int h) == 1)
             {
-                var dec = new JpegBitmapDecoder(ms, BitmapCreateOptions.PreservePixelFormat | BitmapCreateOptions.IgnoreColorProfile, BitmapCacheOption.OnLoad);
-                src = dec.Frames[0];
+                _writer?.Write(_pixels, w, h);
+                _lastFrameUtc = DateTime.UtcNow;
             }
 
-            int rot = ((rotation + _settings.ExtraRotation) % 360 + 360) % 360;
-            bool mirror = _settings.Mirror;
-            int w = src.PixelWidth, h = src.PixelHeight;
-            int rw = (rot == 90 || rot == 270) ? h : w;
-            int rh = (rot == 90 || rot == 270) ? w : h;
-            double scale = Math.Min(1.0, Math.Min((double)SharedFrameWriter.MaxWidth / rw, (double)SharedFrameWriter.MaxHeight / rh));
-
-            if (rot != 0 || mirror || scale < 1.0)
+            // small preview for this window
+            if (Interlocked.CompareExchange(ref _previewPending, 1, 0) != 0) return;
+            const int pw = 1280, ph = 720;
+            if (_previewPixels.Length != pw * ph * 4) _previewPixels = new byte[pw * ph * 4];
+            if (NativeMethods.OvraDec_Render(dec, _previewPixels, _previewPixels.Length, rot, mirror, pw, ph, out int vw, out int vh) != 1)
             {
-                var tg = new TransformGroup();
-                if (rot != 0) tg.Children.Add(new RotateTransform(rot));
-                if (mirror) tg.Children.Add(new ScaleTransform(-1, 1));
-                if (scale < 1.0) tg.Children.Add(new ScaleTransform(scale, scale));
-                src = new TransformedBitmap(src, tg);
+                Interlocked.Exchange(ref _previewPending, 0);
+                return;
             }
-            if (src.Format != PixelFormats.Bgra32)
+            var copy = new byte[vw * vh * 4];
+            Buffer.BlockCopy(_previewPixels, 0, copy, 0, copy.Length);
+            Dispatcher.BeginInvoke(new Action(() =>
             {
-                src = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
-            }
-
-            w = src.PixelWidth; h = src.PixelHeight;
-            if (w > SharedFrameWriter.MaxWidth || h > SharedFrameWriter.MaxHeight) return;
-            int stride = w * 4;
-            int size = stride * h;
-            if (_pixels.Length != size) _pixels = new byte[size];
-            src.CopyPixels(_pixels, stride, 0);
-
-            _writer?.Write(_pixels, w, h);
-            _lastFrameUtc = DateTime.UtcNow;
-            Interlocked.Increment(ref _frameCount);
-
-            // preview (skip if the UI is still busy with the previous one, or the window is hidden)
-            if (Interlocked.CompareExchange(ref _previewPending, 1, 0) == 0)
-            {
-                var copy = (byte[])_pixels.Clone();
-                Dispatcher.BeginInvoke(new Action(() =>
+                try
                 {
-                    try
+                    if (IsVisible && _conn != null)
                     {
-                        if (IsVisible && _conn != null)
+                        if (_previewBitmap == null || _previewBitmap.PixelWidth != vw || _previewBitmap.PixelHeight != vh)
                         {
-                            if (_previewBitmap == null || _previewBitmap.PixelWidth != w || _previewBitmap.PixelHeight != h)
-                            {
-                                _previewBitmap = new WriteableBitmap(w, h, 96, 96, PixelFormats.Bgra32, null);
-                                Preview.Source = _previewBitmap;
-                            }
-                            _previewBitmap.WritePixels(new Int32Rect(0, 0, w, h), copy, stride, 0);
-                            PreviewHint.Visibility = Visibility.Collapsed;
+                            _previewBitmap = new WriteableBitmap(vw, vh, 96, 96, PixelFormats.Bgra32, null);
+                            Preview.Source = _previewBitmap;
                         }
+                        _previewBitmap.WritePixels(new Int32Rect(0, 0, vw, vh), copy, vw * 4, 0);
+                        PreviewHint.Visibility = Visibility.Collapsed;
                     }
-                    finally
-                    {
-                        Interlocked.Exchange(ref _previewPending, 0);
-                    }
-                }), DispatcherPriority.Render);
-            }
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _previewPending, 0);
+                }
+            }), DispatcherPriority.Render);
         }
 
         private void UpdateLiveUi()
@@ -623,7 +726,7 @@ namespace OvraCam
             if (_conn != null && (DateTime.UtcNow - _lastFrameUtc).TotalSeconds < 2)
             {
                 FpsBadge.Visibility = Visibility.Visible;
-                FpsText.Text = $"LIVE · {_fps:0} fps · {_conn.Via}";
+                FpsText.Text = $"LIVE · {QualityLabel(_phoneStatus?.res ?? _settings.Quality)} · {_fps:0} fps · {_conn.Via}";
             }
             else
             {
